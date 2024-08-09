@@ -653,20 +653,17 @@ class SubstrateInterface:
         if not block_hash:
             block_hash = self.get_chain_head()
 
-        self.block_hash = block_hash
-        self.block_id = block_id
-
         # In fact calls and storage functions are decoded against runtime of previous block, therefor retrieve
         # metadata and apply type registry of runtime of parent block
-        block_header = self.rpc_request('chain_getHeader', [self.block_hash])
+        block_header = self.rpc_request('chain_getHeader', [block_hash])
 
         if block_header['result'] is None:
-            raise BlockNotFound(f'Block not found for "{self.block_hash}"')
+            raise BlockNotFound(f'Block not found for "{block_hash}"')
 
         parent_block_hash = block_header['result']['parentHash']
 
         if parent_block_hash == '0x0000000000000000000000000000000000000000000000000000000000000000':
-            runtime_block_hash = self.block_hash
+            runtime_block_hash = block_hash
         else:
             runtime_block_hash = parent_block_hash
 
@@ -677,32 +674,34 @@ class SubstrateInterface:
 
         # Check if runtime state already set to current block
         if runtime_info.get("specVersion") == self.runtime_version:
+            self.block_hash = block_hash
+            self.block_id = block_id
             return
 
-        self.runtime_version = runtime_info.get("specVersion")
-        self.transaction_version = runtime_info.get("transactionVersion")
+        runtime_version = runtime_info.get("specVersion")
+        transaction_version = runtime_info.get("transactionVersion")
 
-        if self.cache_region and self.runtime_version not in self.__metadata_cache:
+        if self.cache_region and runtime_version not in self.__metadata_cache:
             # Try to retrieve metadata from Dogpile cache
-            cached_metadata = self.cache_region.get('METADATA_{}'.format(self.runtime_version))
+            cached_metadata = self.cache_region.get('METADATA_{}'.format(runtime_version))
             if cached_metadata:
-                self.debug_message('Retrieved metadata for {} from Redis'.format(self.runtime_version))
-                self.__metadata_cache[self.runtime_version] = cached_metadata
+                self.debug_message('Retrieved metadata for {} from Redis'.format(runtime_version))
+                self.__metadata_cache[runtime_version] = cached_metadata
 
-        if self.runtime_version in self.__metadata_cache:
+        if runtime_version in self.__metadata_cache:
             # Get metadata from cache
-            self.debug_message('Retrieved metadata for {} from memory'.format(self.runtime_version))
-            self.metadata = self.__metadata_cache[self.runtime_version]
+            self.debug_message('Retrieved metadata for {} from memory'.format(runtime_version))
+            self.metadata = self.__metadata_cache[runtime_version]
         else:
             self.metadata = self.get_block_metadata(block_hash=runtime_block_hash, decode=True)
-            self.debug_message('Retrieved metadata for {} from Substrate node'.format(self.runtime_version))
+            self.debug_message('Retrieved metadata for {} from Substrate node'.format(runtime_version))
 
             # Update metadata cache
-            self.__metadata_cache[self.runtime_version] = self.metadata
+            self.__metadata_cache[runtime_version] = self.metadata
 
             if self.cache_region:
-                self.debug_message('Stored metadata for {} in Redis'.format(self.runtime_version))
-                self.cache_region.set('METADATA_{}'.format(self.runtime_version), self.metadata)
+                self.debug_message('Stored metadata for {} in Redis'.format(runtime_version))
+                self.cache_region.set('METADATA_{}'.format(runtime_version), self.metadata)
 
         # Update type registry
         self.reload_type_registry(
@@ -716,13 +715,7 @@ class SubstrateInterface:
             self.runtime_config.add_portable_registry(self.metadata)
 
         # Set active runtime version
-        self.runtime_config.set_active_spec_version_id(self.runtime_version)
-
-        # Check and apply runtime constants
-        ss58_prefix_constant = self.get_constant("System", "SS58Prefix", block_hash=block_hash)
-
-        if ss58_prefix_constant:
-            self.ss58_format = ss58_prefix_constant.value
+        self.runtime_config.set_active_spec_version_id(runtime_version)
 
         # Set runtime compatibility flags
         try:
@@ -732,6 +725,27 @@ class SubstrateInterface:
         except NotImplementedError:
             self.config['is_weight_v2'] = False
             self.runtime_config.update_type_registry_types({'Weight': 'WeightV1'})
+
+        # Set values on self only when initialization succeeds.
+        undo_block_hash = self.block_hash
+        self.block_hash = block_hash
+
+        # Check and apply runtime constants
+        # Note that this calls back on init_runtime() so self.block_hash needs
+        # to be set as a reentrancy guard.
+        try:
+            ss58_prefix_constant = self.get_constant("System", "SS58Prefix", block_hash=block_hash)
+            if ss58_prefix_constant:
+                self.ss58_format = ss58_prefix_constant.value
+        except Exception as e:
+            # If this fails, raise without leaving anything set that might
+            # indicate init succeeded.
+            self.block_hash = undo_block_hash
+            raise e
+
+        self.block_id = block_id
+        self.runtime_version = runtime_version
+        self.transaction_version = transaction_version
 
     def query_map(self, module: str, storage_function: str, params: Optional[list] = None, block_hash: str = None,
                   max_results: int = None, start_key: str = None, page_size: int = 100,
